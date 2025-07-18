@@ -4,10 +4,12 @@ from pathlib import Path
 import sys
 from llama_cpp import Llama
 from huggingface_hub import hf_hub_download
+from flask import Flask, request, jsonify
+from flask_cors import CORS  # Import CORS
 
-
-MODEL_DIR = Path("./models") 
-MODEL_REPO = "TheBloke/Phi-3-mini-4k-instruct-GGUF" 
+# --- All your existing agent code ---
+MODEL_DIR = Path("./models")
+MODEL_REPO = "TheBloke/Phi-3-mini-4k-instruct-GGUF"
 MODEL_FILENAME = "Phi-3-mini-4k-instruct.Q4_K_M.gguf"
 MODEL_PATH = MODEL_DIR / MODEL_FILENAME
 
@@ -20,7 +22,8 @@ TOOL_DEFINITIONS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "attendees": {"type": "array", "items": {"type": "string"}, "description": "List of people to invite."},
+                    "attendees": {"type": "array", "items": {"type": "string"},
+                                  "description": "List of people to invite."},
                     "date": {"type": "string", "description": "The date of the meeting in YYYY-MM-DD format."},
                     "time": {"type": "string", "description": "The time of the meeting in HH:MM format."},
                     "topic": {"type": "string", "description": "The subject or topic of the meeting."},
@@ -46,6 +49,7 @@ TOOL_DEFINITIONS = [
     },
 ]
 
+
 def schedule_meeting(attendees, date, time, topic):
     try:
         dt = datetime.fromisoformat(f"{date}T{time}")
@@ -54,10 +58,12 @@ def schedule_meeting(attendees, date, time, topic):
     except (ValueError, TypeError) as e:
         return f"Error scheduling meeting: Invalid date or time format. Details: {e}"
 
+
 def fetch_weather(city, units="metric"):
     temp = 22 if units == "metric" else 72
     unit_label = "°C" if units == "metric" else "°F"
     return f"🌤️ The current temperature in {city} is {temp}{unit_label}."
+
 
 FUNCTION_IMPLEMENTATIONS = {
     "schedule_meeting": schedule_meeting,
@@ -66,61 +72,41 @@ FUNCTION_IMPLEMENTATIONS = {
 
 
 class FunctionCallingAgent:
-    """An agent that can use tools to answer questions."""
-
     def __init__(self, model_path, tools, function_implementations):
         self.model_path = Path(model_path)
         self.tools = tools
         self.function_implementations = function_implementations
-        
         self._ensure_model_exists()
-
-        print("Initializing model... (This may take a moment)")
+        print("Initializing model... (This may take a few moments)")
         self.llm = Llama(
-            model_path=str(self.model_path), 
+            model_path=str(self.model_path),
             chat_format="chatml",
             n_ctx=4096,
             n_threads=6,
             verbose=False,
         )
-        print("Model initialized.")
+        print("Model initialized successfully.")
         self.system_prompt = self._create_system_prompt()
         self.chat_history = [{"role": "system", "content": self.system_prompt}]
 
     def _ensure_model_exists(self):
-        """Checks if the model file exists, and if not, prompts the user to download it."""
         if not self.model_path.is_file():
-            print(f"Model not found at '{self.model_path}'")
-            
-            # Ask the user for permission to download
-            choice = input("Would you like to download the model? (approx. 2.2 GB) [Y/n]: ").strip().lower()
-            
-            if choice in ["y", "yes"]: # Default to 'yes' if they just press Enter
-                print(f"Downloading '{MODEL_FILENAME}' from Hugging Face...")
-                print(f"Repo: {MODEL_REPO}")
-
-                # Create the model directory if it doesn't exist
+            print(f"Model not found at '{self.model_path}'. Downloading...")
+            try:
                 self.model_path.parent.mkdir(parents=True, exist_ok=True)
-                
-                try:
-                    # Use huggingface_hub to download with a progress bar
-                    hf_hub_download(
-                        repo_id=MODEL_REPO,
-                        filename=MODEL_FILENAME,
-                        local_dir=self.model_path.parent,
-                        local_dir_use_symlinks=False, # Copies the file to your dir
-                    )
-                    print(" Download complete.")
-                except Exception as e:
-                    print(f" An error occurred during download: {e}")
-                    print("Please try downloading the model manually and placing it in the 'models' directory.")
-                    sys.exit(1) 
-            else:
-                print("Download declined. Exiting.")
-                sys.exit(0) 
+                hf_hub_download(
+                    repo_id=MODEL_REPO,
+                    filename=MODEL_FILENAME,
+                    local_dir=self.model_path.parent,
+                    local_dir_use_symlinks=False,
+                )
+                print("Download complete.")
+            except Exception as e:
+                print(f"An error occurred during download: {e}")
+                sys.exit(1)
 
-   
     def _create_system_prompt(self):
+        # ... (This function is unchanged)
         prompt_parts = [
             "You are a helpful assistant that strictly follows instructions to call functions.",
             f"The current date and time is: {datetime.now().isoformat()}",
@@ -140,74 +126,82 @@ class FunctionCallingAgent:
             )
         prompt_parts.append("\n--- END OF TOOLS ---")
         return "\n".join(prompt_parts)
-        
+
     def chat(self, user_query):
-        self.chat_history.append({"role": "user", "content": user_query})
+        # This is kept mostly the same, but we will reset history for each API call
+        # for a stateless API. If you want to maintain session state, this would need adjustment.
+        chat_session = [
+            {"role": "system", "content": self.system_prompt},
+            {"role": "user", "content": user_query}
+        ]
+
         response = self.llm.create_chat_completion(
-            messages=self.chat_history,
+            messages=chat_session,
             tools=self.tools,
             tool_choice="auto",
             temperature=0.0,
         )
         choice = response["choices"][0]["message"]
-        self.chat_history.append(choice)
         content = choice.get("content", "")
         final_answer = None
 
         try:
             tool_call_data = json.loads(content)
             if (isinstance(tool_call_data, dict) and
-                "name" in tool_call_data and
-                tool_call_data["name"] in self.function_implementations):
-                print(f"Bot wants to use a tool (detected from content): {tool_call_data['name']}")
+                    "name" in tool_call_data and
+                    tool_call_data["name"] in self.function_implementations):
+                print(f"Bot wants to use tool: {tool_call_data['name']}")
                 fn_name = tool_call_data["name"]
                 args = tool_call_data.get("arguments", {})
-                try:
-                    print(f"  > Calling function: {fn_name} with args: {args}")
-                    function_to_call = self.function_implementations[fn_name]
-                    final_answer = function_to_call(**args)
-                except Exception as e:
-                    print(f"  > Error calling function {fn_name}: {e}")
-                    final_answer = f"Error executing tool {fn_name}: {e}"
+                function_to_call = self.function_implementations[fn_name]
+                final_answer = function_to_call(**args)
             else:
                 final_answer = content
         except (json.JSONDecodeError, TypeError):
-            print("Bot responded directly.")
+            print("Bot responded directly with text.")
             final_answer = content
-        self.chat_history.append({"role": "assistant", "content": final_answer})
+
+        print(f"Final answer to be sent: {final_answer}")
         return final_answer
 
-def main():
-    """The main function to run the chat application."""
-    print("🔧 Initializing Chat with Function-Calling Phi-3 Mini...")
-    
-    agent = FunctionCallingAgent(
-        model_path=MODEL_PATH,
-        tools=TOOL_DEFINITIONS,
-        function_implementations=FUNCTION_IMPLEMENTATIONS
-    )
 
-    print("\n Agent is ready! Type 'exit' to quit.\n")
-    
-    while True:
-        try:
-            user_input = input("You: ")
-            if user_input.strip().lower() in {"exit", "quit"}:
-                print("Goodbye!")
-                break
-            
-            if not user_input.strip():
-                continue
+# --- NEW: Flask API Implementation ---
 
-            bot_response = agent.chat(user_input)
-            print("Bot:", bot_response)
+# 1. Initialize the Flask App
+app = Flask(__name__)
+CORS(app)  # Enable Cross-Origin Resource Sharing
 
-        except KeyboardInterrupt:
-            print("\nGoodbye!")
-            break
-        except Exception as e:
-            print(f"An unexpected error occurred: {e}")
-            break
+# 2. Load the Agent (This happens only once on startup)
+print("🔧 Initializing Function-Calling Agent for Flask Server...")
+agent = FunctionCallingAgent(
+    model_path=MODEL_PATH,
+    tools=TOOL_DEFINITIONS,
+    function_implementations=FUNCTION_IMPLEMENTATIONS
+)
+print("\n✅ Agent is loaded and ready to receive requests.")
 
-if __name__ == "__main__":
-    main()
+
+# 3. Define the chat endpoint
+@app.route('/chat', methods=['POST'])
+def chat_endpoint():
+    """Receives a user message and returns the agent's response."""
+    if not request.json or 'message' not in request.json:
+        return jsonify({"error": "Invalid request: 'message' key not found in JSON payload."}), 400
+
+    user_message = request.json['message']
+    print(f"\nReceived message: '{user_message}'")
+
+    if not user_message.strip():
+        return jsonify({"error": "Message cannot be empty."}), 400
+
+    try:
+        bot_response = agent.chat(user_message)
+        return jsonify({"response": bot_response})
+    except Exception as e:
+        print(f"An error occurred during chat processing: {e}")
+        return jsonify({"error": "An internal error occurred."}), 500
+
+
+# 4. Run the app on a specific port (e.g., 5001) to avoid conflicts
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5001, debug=True)
